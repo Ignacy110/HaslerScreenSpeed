@@ -28,6 +28,7 @@
         /// </summary>
         private void InitializeComponent()
         {
+            System.ComponentModel.ComponentResourceManager resources = new System.ComponentModel.ComponentResourceManager(typeof(Form1));
             label1 = new Label();
             textBoxComNumber = new TextBox();
             textBoxComSpeed = new TextBox();
@@ -113,8 +114,11 @@
             Controls.Add(label2);
             Controls.Add(textBoxComNumber);
             Controls.Add(label1);
+            FormBorderStyle = FormBorderStyle.FixedSingle;
+            Icon = (Icon)resources.GetObject("$this.Icon");
+            MaximizeBox = false;
             Name = "Form1";
-            Text = "Form1";
+            Text = "Hasler Screen Speed";
             ResumeLayout(false);
             PerformLayout();
         }
