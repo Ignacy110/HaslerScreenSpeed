@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.IO;
 using System.IO.Ports;
 using System.Linq;
+using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using OpenCvSharp;
@@ -14,29 +16,27 @@ namespace HaslerScreenSpeed
     {
         private SerialPort _serialPort;
         private System.Windows.Forms.Timer _loopTimer;
-        private Dictionary<int, Mat> _templates = new Dictionary<int, Mat>();
+        private readonly Dictionary<int, Mat> _templates = new Dictionary<int, Mat>();
 
-        // Volatile variable ensures cross-thread visibility between the UI thread and the serial port thread
         private volatile bool _canSendNext = false;
 
-        // Thread-safe buffer and lock object for serial communication
-        private List<byte> _serialBuffer = new List<byte>();
+        private readonly List<byte> _serialBuffer = new List<byte>();
         private readonly object _serialLock = new object();
 
-        // Bounding box configuration for screen capture (X, Y, Width, Height)
-        private readonly int _capX = 1650;
-        private readonly int _capY = 920;
-        private readonly int _capW = 126;
-        private readonly int _capH = 80;
-
-        // Confidence threshold for template matching (ranges from 0.0 to 1.0)
+        private readonly string _configFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
         private readonly double _threshold = 0.75;
+
+        // Zmienne pomocnicze dla bufora braku odczytu cyfr
+        private DateTime? _noDigitStartTime = null;
+        private int _lastValidSpeed = 0;
 
         public Form1()
         {
             InitializeComponent();
             LoadTemplates();
             InitializeSerial();
+
+            LoadSettings();
         }
 
         private void InitializeSerial()
@@ -44,40 +44,129 @@ namespace HaslerScreenSpeed
             _serialPort = new SerialPort();
             _serialPort.DataReceived += SerialPort_DataReceived;
 
-            _loopTimer = new System.Windows.Forms.Timer { Interval = 500 };
+            _loopTimer = new System.Windows.Forms.Timer { Interval = 100 };
             _loopTimer.Tick += LoopTimer_Tick;
         }
+
+        #region Obs³uga Ustawieñ (Save / Load Config) i Portów COM
+
+        private void RefreshComPorts(string savedPortName)
+        {
+            comboBoxComNumber.Items.Clear();
+            string[] availablePorts = SerialPort.GetPortNames();
+
+            if (availablePorts.Length > 0)
+            {
+                comboBoxComNumber.Items.AddRange(availablePorts);
+
+                if (!string.IsNullOrEmpty(savedPortName) && availablePorts.Contains(savedPortName))
+                {
+                    comboBoxComNumber.SelectedItem = savedPortName;
+                }
+                else
+                {
+                    comboBoxComNumber.SelectedIndex = 0;
+                }
+            }
+            else
+            {
+                comboBoxComNumber.Text = string.Empty;
+            }
+        }
+
+        private void LoadSettings()
+        {
+            AppSettings settings = null;
+
+            try
+            {
+                if (File.Exists(_configFilePath))
+                {
+                    string json = File.ReadAllText(_configFilePath);
+                    settings = JsonSerializer.Deserialize<AppSettings>(json);
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("B³¹d odczytu pliku konfiguracyjnego: " + ex.Message);
+            }
+
+            if (settings == null)
+            {
+                settings = new AppSettings();
+            }
+
+            textBoxSpeedX.Text = settings.CapX.ToString();
+            textBoxSpeedY.Text = settings.CapY.ToString();
+            textBoxSpeedLength.Text = settings.CapW.ToString();
+            textBoxSpeedHeight.Text = settings.CapH.ToString();
+            textBoxComSpeed.Text = settings.BaudRate.ToString();
+            textBoxWaitingTime.Text = settings.WaitingTime.ToString();
+
+            RefreshComPorts(settings.PortName);
+        }
+
+        private void SaveSettings()
+        {
+            try
+            {
+                var settings = new AppSettings
+                {
+                    CapX = int.TryParse(textBoxSpeedX.Text, out int x) ? x : 0,
+                    CapY = int.TryParse(textBoxSpeedY.Text, out int y) ? y : 0,
+                    CapW = int.TryParse(textBoxSpeedLength.Text, out int w) ? w : 100,
+                    CapH = int.TryParse(textBoxSpeedHeight.Text, out int h) ? h : 100,
+                    BaudRate = int.TryParse(textBoxComSpeed.Text, out int b) ? b : 115200,
+                    PortName = comboBoxComNumber.SelectedItem?.ToString() ?? comboBoxComNumber.Text.Trim(),
+                    WaitingTime = double.TryParse(textBoxWaitingTime.Text, out double wt) ? wt : 3.0
+                };
+
+                string json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(_configFilePath, json);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("B³¹d zapisu pliku konfiguracyjnego: " + ex.Message);
+            }
+        }
+
+        #endregion
 
         private void LoadTemplates()
         {
             try
             {
-                string path = AppDomain.CurrentDomain.BaseDirectory + "templates\\";
+                string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "templates");
                 for (int i = 0; i <= 9; i++)
                 {
-                    Mat t = Cv2.ImRead($"{path}{i}.png", ImreadModes.Grayscale);
+                    string filePath = Path.Combine(path, $"{i}.png");
+                    Mat t = Cv2.ImRead(filePath, ImreadModes.Grayscale);
                     if (!t.Empty())
+                    {
                         _templates.Add(i, t);
+                    }
                     else
-                        MessageBox.Show($"Error loading template: {i}.png");
+                    {
+                        MessageBox.Show($"B³¹d ³adowania szablonu: {i}.png");
+                    }
                 }
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Template loading error: " + ex.Message);
+                MessageBox.Show("B³¹d krytyczny podczas ³adowania szablonów: " + ex.Message);
             }
         }
 
-        // --- MICROCONTROLLER DATA RECEIVE HANDLER ---
         private void SerialPort_DataReceived(object sender, SerialDataReceivedEventArgs e)
         {
+            if (!_serialPort.IsOpen) return;
+
             int bytesToRead = _serialPort.BytesToRead;
             if (bytesToRead == 0) return;
 
             byte[] tempBuffer = new byte[bytesToRead];
             _serialPort.Read(tempBuffer, 0, bytesToRead);
 
-            // Protect against frame fragmentation and corrupted/garbage data
             lock (_serialLock)
             {
                 _serialBuffer.AddRange(tempBuffer);
@@ -87,11 +176,11 @@ namespace HaslerScreenSpeed
                     if (_serialBuffer[0] == 0xEF && _serialBuffer[1] == 0xEF)
                     {
                         _canSendNext = true;
-                        _serialBuffer.RemoveRange(0, 20); // Remove the complete, valid data frame
+                        _serialBuffer.RemoveRange(0, 20);
                     }
                     else
                     {
-                        _serialBuffer.RemoveAt(0); // Invalid header - shift by 1 byte and continue searching
+                        _serialBuffer.RemoveAt(0);
                     }
                 }
             }
@@ -103,50 +192,123 @@ namespace HaslerScreenSpeed
             {
                 if (!_serialPort.IsOpen)
                 {
-                    _serialPort.PortName = textBoxComNumber.Text.Trim();
-                    _serialPort.BaudRate = int.Parse(textBoxComSpeed.Text.Trim());
+                    string selectedPort = comboBoxComNumber.SelectedItem?.ToString() ?? comboBoxComNumber.Text.Trim();
+
+                    if (string.IsNullOrEmpty(selectedPort))
+                    {
+                        MessageBox.Show("Brak wybranego lub dostêpnego portu COM w systemie.");
+                        return;
+                    }
+
+                    _serialPort.PortName = selectedPort;
+
+                    if (!int.TryParse(textBoxComSpeed.Text.Trim(), out int baudRate))
+                    {
+                        MessageBox.Show("Nieprawid³owa prêdkoœæ portu COM (Baud Rate).");
+                        return;
+                    }
+                    _serialPort.BaudRate = baudRate;
                     _serialPort.Open();
 
-                    lock (_serialLock) { _serialBuffer.Clear(); } // Clear buffer before starting
-                    _canSendNext = false;
+                    lock (_serialLock)
+                    {
+                        _serialBuffer.Clear();
+                    }
 
-                    // Fetch the initial speed (blocks the UI only for a fraction of a second at startup)
-                    int initialSpeed = GetSpeedFromScreen();
-                    SendHaslerData((byte)Math.Min(initialSpeed, 255));
+                    // Resetujemy zmienne pomocnicze
+                    _lastValidSpeed = 0;
+                    _noDigitStartTime = null;
 
                     _loopTimer.Start();
-                    MessageBox.Show("Communication started (Ping-Pong mode).");
+
+                    // Na starcie transmisji wysy³amy ramkê z prêdkoœci¹ 0 km/h
+                    SendHaslerData(0);
+
+                    MessageBox.Show($"Po³¹czenie uruchomione na porcie {selectedPort} (Tryb Ping-Pong).");
                 }
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Port opening error: " + ex.Message);
+                MessageBox.Show("B³¹d otwarcia portu: " + ex.Message);
             }
         }
 
         private void buttonComStop_Click(object sender, EventArgs e)
         {
-            _loopTimer.Stop();
-            if (_serialPort.IsOpen) _serialPort.Close();
-            _canSendNext = false;
-            MessageBox.Show("Stopped.");
+            StopCommunication();
+            MessageBox.Show("Po³¹czenie zatrzymane.");
         }
 
-        // Using async void allows using 'await' inside the Timer tick event handler
+        private void StopCommunication()
+        {
+            _loopTimer.Stop();
+            _canSendNext = false;
+
+            if (_serialPort != null && _serialPort.IsOpen)
+            {
+                try
+                {
+                    // Przy zatrzymaniu transmisji wysy³amy prêdkoœæ 0 km/h
+                    SendHaslerData(0);
+                    System.Threading.Thread.Sleep(100);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine("B³¹d podczas wysy³ania ramki zeruj¹cej: " + ex.Message);
+                }
+                finally
+                {
+                    try { _serialPort.Close(); } catch { }
+                }
+            }
+        }
+
         private async void LoopTimer_Tick(object sender, EventArgs e)
         {
             if (_serialPort.IsOpen && _canSendNext)
             {
-                _canSendNext = false; // Block immediately for the duration of processing time
+                _canSendNext = false;
 
-                // Offload the heavy OCR operation to a background thread (Thread Pool)
-                int speed = await Task.Run(() => GetSpeedFromScreen());
+                int capX = int.TryParse(textBoxSpeedX.Text, out int x) ? x : 0;
+                int capY = int.TryParse(textBoxSpeedY.Text, out int y) ? y : 0;
+                int capW = int.TryParse(textBoxSpeedLength.Text, out int w) ? w : 100;
+                int capH = int.TryParse(textBoxSpeedHeight.Text, out int h) ? h : 100;
 
-                // After the 'await', execution automatically returns to the interface thread (UI Thread).
-                // Control.Invoke() is no longer required!
-                labelCurrentSpeed.Text = $"{speed} km/h";
+                int? detectedSpeed = await Task.Run(() => GetSpeedFromScreen(capX, capY, capW, capH));
 
-                SendHaslerData((byte)Math.Min(speed, 255));
+                if (detectedSpeed.HasValue)
+                {
+                    // WYKRYTO LICZBÊ
+                    _noDigitStartTime = null;
+                    _lastValidSpeed = detectedSpeed.Value;
+
+                    labelCurrentSpeed.Text = $"{_lastValidSpeed} km/h";
+                    SendHaslerData((byte)Math.Min(_lastValidSpeed, 255));
+                }
+                else
+                {
+                    // NIE WYKRYTO ¯ADNEJ LICZBY
+                    labelCurrentSpeed.Text = "-";
+
+                    if (_noDigitStartTime == null)
+                    {
+                        _noDigitStartTime = DateTime.Now;
+                    }
+
+                    double waitingTime = double.TryParse(textBoxWaitingTime.Text, out double wt) ? wt : 3.0;
+                    double elapsedSeconds = (DateTime.Now - _noDigitStartTime.Value).TotalSeconds;
+
+                    if (elapsedSeconds >= waitingTime)
+                    {
+                        // Czas min¹³ – wysy³amy 0 km/h
+                        SendHaslerData(0);
+                    }
+                    else
+                    {
+                        // Czas nie min¹³ – utrzymujemy ostatni¹ znan¹ prêdkoœæ
+                        SendHaslerData((byte)Math.Min(_lastValidSpeed, 255));
+                    }
+                }
             }
         }
 
@@ -156,22 +318,34 @@ namespace HaslerScreenSpeed
             buffer[0] = 0xEF; buffer[1] = 0xEF; buffer[2] = 0xEF; buffer[3] = 0xEF;
             buffer[4] = speed;
 
-            try { _serialPort.Write(buffer, 0, buffer.Length); }
-            catch { _loopTimer.Stop(); }
+            try
+            {
+                if (_serialPort.IsOpen)
+                {
+                    _serialPort.Write(buffer, 0, buffer.Length);
+                }
+            }
+            catch
+            {
+                _loopTimer.Stop();
+                _canSendNext = false;
+                try { _serialPort.Close(); } catch { }
+            }
         }
 
-        private int GetSpeedFromScreen()
+        private int? GetSpeedFromScreen(int capX, int capY, int capW, int capH)
         {
             try
             {
-                using (Bitmap bmp = new Bitmap(_capW, _capH))
+                if (capW <= 0 || capH <= 0) return null;
+
+                using (Bitmap bmp = new Bitmap(capW, capH))
                 {
                     using (Graphics g = Graphics.FromImage(bmp))
                     {
-                        g.CopyFromScreen(_capX, _capY, 0, 0, bmp.Size, CopyPixelOperation.SourceCopy);
+                        g.CopyFromScreen(capX, capY, 0, 0, bmp.Size, CopyPixelOperation.SourceCopy);
                     }
 
-                    // Proper management of unmanaged memory for Mat instances using 'using' statements
                     using (Mat source = bmp.ToMat())
                     using (Mat graySource = new Mat())
                     {
@@ -184,64 +358,116 @@ namespace HaslerScreenSpeed
                             {
                                 Cv2.MatchTemplate(graySource, template.Value, res, TemplateMatchModes.CCoeffNormed);
 
-                                // Fast peak location instead of slow pixel-by-pixel nested loop iterations
                                 while (true)
                                 {
                                     Cv2.MinMaxLoc(res, out _, out double maxVal, out _, out OpenCvSharp.Point maxLoc);
 
                                     if (maxVal >= _threshold)
                                     {
-                                        foundDigits.Add(new DetectedDigit { Value = template.Key, X = maxLoc.X, Confidence = (float)maxVal });
+                                        foundDigits.Add(new DetectedDigit
+                                        {
+                                            Value = template.Key,
+                                            X = maxLoc.X,
+                                            Width = template.Value.Width,
+                                            Confidence = (float)maxVal
+                                        });
 
-                                        // Clear out the detected region to potentially find the same digit adjacent to it (e.g., "11")
                                         int startX = Math.Max(0, maxLoc.X - template.Value.Width / 2);
                                         int width = Math.Min(res.Cols - startX, template.Value.Width);
                                         using (Mat roi = new Mat(res, new Rect(startX, 0, width, res.Rows)))
                                         {
-                                            roi.SetTo(new Scalar(0)); // Reset match scores in this specific region to 0
+                                            roi.SetTo(new Scalar(0));
                                         }
                                     }
                                     else
                                     {
-                                        break; // Break the loop when there are no more matches for this digit
+                                        break;
                                     }
                                 }
                             }
                         }
 
-                        // Proximity filtering / Non-maximum suppression
-                        var finalDigits = foundDigits.OrderByDescending(d => d.Confidence).ToList();
+                        var sortedDigits = foundDigits.OrderByDescending(d => d.Confidence).ToList();
+                        var finalDigits = new List<DetectedDigit>();
 
-                        for (int i = 0; i < finalDigits.Count; i++)
+                        foreach (var digit in sortedDigits)
                         {
-                            finalDigits.RemoveAll(d => d != finalDigits[i] && Math.Abs(d.X - finalDigits[i].X) < 10);
+                            bool overlaps = false;
+                            foreach (var accepted in finalDigits)
+                            {
+                                int overlapStart = Math.Max(digit.X, accepted.X);
+                                int overlapEnd = Math.Min(digit.X + digit.Width, accepted.X + accepted.Width);
+
+                                if (overlapStart < overlapEnd)
+                                {
+                                    int overlapWidth = overlapEnd - overlapStart;
+                                    int minWidth = Math.Min(digit.Width, accepted.Width);
+
+                                    if (overlapWidth > minWidth * 0.3)
+                                    {
+                                        overlaps = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (!overlaps)
+                            {
+                                finalDigits.Add(digit);
+                            }
+                        }
+
+                        // Jeœli nie odnaleziono cyfr, zwracamy null
+                        if (finalDigits.Count == 0)
+                        {
+                            return null;
                         }
 
                         string result = string.Concat(finalDigits.OrderBy(d => d.X).Select(d => d.Value));
-                        return int.TryParse(result, out int speed) ? speed : 0;
+                        return int.TryParse(result, out int speed) ? speed : null;
                     }
                 }
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine("Capture or tracking error: " + ex.Message);
-                return 0;
+                System.Diagnostics.Debug.WriteLine("B³¹d OCR/Przechwytywania: " + ex.Message);
+                return null;
             }
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            _loopTimer?.Stop();
-            if (_serialPort != null && _serialPort.IsOpen) _serialPort.Close();
-            foreach (var t in _templates.Values) t.Dispose(); // Release template resources loaded from disk
+            SaveSettings();
+            StopCommunication();
+
+            _loopTimer?.Dispose();
+
+            if (_serialPort != null)
+            {
+                _serialPort.Dispose();
+            }
+
+            foreach (var t in _templates.Values) t.Dispose();
             base.OnFormClosing(e);
         }
+    }
+
+    public class AppSettings
+    {
+        public int CapX { get; set; } = 0;
+        public int CapY { get; set; } = 0;
+        public int CapW { get; set; } = 100;
+        public int CapH { get; set; } = 100;
+        public string PortName { get; set; } = "COM1";
+        public int BaudRate { get; set; } = 115200;
+        public double WaitingTime { get; set; } = 3.0;
     }
 
     public class DetectedDigit
     {
         public int Value;
         public int X;
+        public int Width;
         public float Confidence;
     }
 }
